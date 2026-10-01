@@ -19,7 +19,7 @@ Playwright runs the complete journey, declined-consent shopping, and empty direc
 
 - Production build and TypeScript check passed.
 - 13 unit/contract tests passed.
-- 8 browser tests passed: four scenarios at both desktop and mobile sizes, including checkout-attempt refresh and consent reset/reacceptance without conversion replay.
+- 10 browser tests passed: four journey scenarios at both desktop and mobile sizes, plus layout regression checks from 390px through 3776px. The layout check verifies that hero text and artwork stay above the sections below with no horizontal overflow.
 - Production HTTP smoke checks passed for all eight route types; invalid product routes return 404.
 - Desktop and mobile home layouts were visually inspected and checked for horizontal overflow.
 - Real SDK initialization, payload serialization, and OpenAI network delivery remain unverified and disabled. No public Vercel deployment was performed.
