@@ -149,6 +149,8 @@ Do not add a real payment provider.
 
 Use local state / React context for cart state and persist the cart in `localStorage`.
 
+Read browser storage only on the client after hydration. Validate restored data and handle unavailable or corrupt storage without crashing. Persist completed order and membership snapshots so confirmation routes can display the existing outcome after refresh. Direct navigation to a confirmation route without a valid saved outcome must show an empty-state message and must not create an outcome or emit a conversion.
+
 **Reason:** The demo needs state across routes, but Redux or a database would be unnecessary complexity for a three-product demo.
 
 ---
@@ -209,7 +211,7 @@ Purpose:
 - review purchase intent.
 
 Measurement:
-- optional `page_viewed` if useful for the demo, but avoid unnecessary event volume.
+- `page_viewed`, once per eligible route visit under the centralized route-view rules.
 
 ### Checkout `/checkout`
 Purpose:
@@ -268,6 +270,10 @@ Each product should have:
 
 **Reason for integer cents:** OpenAI's documented event schema expects monetary values as integers in the standard minor currency unit. For example, `$148.00` should be represented as `14800` with currency `USD`.
 
+**Demo currency scope:** USD only. Store positive safe-integer prices in cents and positive integer cart quantities. The demo has no shipping charges, taxes, or discounts, so order value is the sum of item subtotals. Future international support must use each supported currency's minor-unit exponent; do not multiply every currency by 100.
+
+**Quantity-two contract:** Two Aero Run Jackets have a unit price of `14800`, quantity `2`, line subtotal `29600`, and cart/order total `29600` USD. Confirm whether the documented per-content `amount` represents unit price or line subtotal before constructing the SDK payload, and include that verified example in the tests. `items_added` reports only the quantity added by that action: adding one jacket to a cart that already contains one reports a delta of one and an event value of `14800`, not the resulting cart total. Checkout and order payloads report the complete snapshot and its total.
+
 ---
 
 ## 6. Measurement architecture
@@ -291,7 +297,9 @@ Responsibilities:
 - expose safe wrapper functions,
 - verify browser environment,
 - call `window.oaiq`,
-- gracefully handle the Pixel not being ready,
+- manage consent and initialization explicitly,
+- hand consented events to the official SDK queue while its script loads, using the documented installation stub,
+- handle script-loading failure without throwing into commerce or enrollment actions,
 - optionally record events in a local demo/debug log,
 - prevent measurement code from leaking across UI components.
 
@@ -313,6 +321,8 @@ Include TypeScript definitions for:
 - locally-used OpenAI event payload structures.
 
 Do not invent undocumented OpenAI payload fields.
+
+Keep domain unit price, quantity, line subtotal, and order total distinct. Before implementation, verify the official meanings of top-level `amount` and per-content `amount`; record the checked documentation date and final quantity-two payload in `TESTING.md`. The examples below are conceptual until this verification is complete.
 
 ---
 
@@ -338,6 +348,10 @@ The Pixel ID is not a server secret, but configuration is preferable to scatteri
 
 During development, enable Pixel debug logging.
 
+Install the documented queue stub before any consented event can be handed to the SDK. Set consent to false before initialization whenever the preference is unknown or declined; initialize once per browser document, then apply the resolved preference using the documented consent API. If the current SDK requires a different ordering, follow its documentation and record the change. Never rely on a late consent update to prevent an initial measurement ping.
+
+Use the official SDK queue rather than introducing a second persistent event queue. If script loading fails, keep commerce functional and report the failure locally. Do not promise delivery or replay conversions on a later page load. Any later delivery attempt must retain the original event ID and must remain consent-gated; conversion pages must never reconstruct events merely to retry them.
+
 Before implementing the script, Codex should verify the current installation snippet in the official documentation:
 
 https://developers.openai.com/ads/measurement-pixel
@@ -349,14 +363,16 @@ https://developers.openai.com/ads/measurement-pixel
 Implement a lightweight **demo measurement-consent banner**.
 
 Behavior:
-1. On first visit, no stored preference exists.
-2. Show:
-   - Accept measurement
-   - Decline
-3. Set OpenAI Pixel consent before normal measurement begins.
-4. Persist the user's choice locally.
-5. If declined, do not send measurement events.
-6. Allow the demo user to reset the consent choice from a small footer/debug control.
+1. Model the preference explicitly as `unknown`, `accepted`, or `declined`. Treat missing, corrupt, or unreadable stored preferences as `unknown`.
+2. Before Pixel initialization, set consent false unless a valid accepted preference has been resolved. No measurement events may be submitted while consent is unknown or declined.
+3. For unknown consent, show equally accessible "Accept measurement" and "Decline" controls.
+4. On acceptance, update SDK consent using its documented API and persist the choice where storage is available. Emit one applicable view event for the currently visible route after consent is enabled; subsequent actions may be measured.
+5. Never retain or replay shopping actions or conversions performed before consent. The current-route view on acceptance represents the newly measurable view, not a replay of prior history.
+6. On decline, keep consent false and persist the choice. The storefront and checkout remain usable.
+7. Provide a footer control to change the preference or reset it to unknown. Revocation/reset immediately sets SDK consent false, stops new measurement submissions, and clears any application-held pending measurement data. Reset reopens the banner.
+8. Revocation cannot retract requests already sent. Verify the SDK's handling of queued events at revocation against the current documentation and test that no queued event is transmitted while consent is false. Do not resume previously queued events merely because consent is granted again; if the SDK cannot safely discard pending events, defer script loading until acceptance and submit events only once the SDK is loaded and consent remains accepted. Suppress actions during loading rather than retain them for replay, and document this coverage tradeoff.
+
+Consent handling belongs in the initial measurement implementation phase, before live events are enabled.
 
 **Reason:** Nano Motion plans international expansion. Consent-aware measurement demonstrates that the implementation was designed with real deployment conditions in mind rather than assuming one market.
 
@@ -396,12 +412,16 @@ Example conceptual payload:
 
 **Reason:** Gives visibility into meaningful landing/page engagement without treating every component interaction as a conversion.
 
+**Route-view boundaries:** Use a centralized route observer. Initial document loads, committed client-side route changes, and back/forward navigation each establish a new visit. A hard refresh establishes a new view visit; rerenders and React Strict Mode effect replay do not. Query/hash changes alone do not create another view, including changes to `measurementDebug`. Use `contents_viewed` for a valid product detail visit and `page_viewed` for the configured generic routes; do not emit both for the same visit. Fix the generic route list to home, shop, cart, checkout, order confirmation, membership, and membership confirmation. Confirmation page views remain distinct from conversion events.
+
+If consent is accepted during a visit, emit its applicable view once at that point. Restoring accepted consent must wait for route and storage hydration so initialization and route observation do not duplicate it. Navigate away and return to the same product to create a new legitimate view; do not deduplicate by pathname for the entire session.
+
 ---
 
 ### 9.2 `contents_viewed`
 
 Trigger:
-- once when a product detail page is viewed.
+- once per eligible product detail route visit, after consent is accepted and the product is resolved.
 
 Example:
 
@@ -459,12 +479,14 @@ Example:
 ### 9.4 `checkout_started`
 
 Trigger:
-- when the user intentionally begins checkout from the cart.
+- when the user intentionally begins checkout from the cart, or directly enters checkout with a valid nonempty cart, under the attempt rules below.
 
 Payload:
 - cart total,
 - currency,
 - all cart contents.
+
+**Checkout attempt boundaries:** Create and persist a checkout-attempt ID when entering checkout with a nonempty valid cart. Direct entry to `/checkout` with a valid cart also creates an attempt. Empty-cart entry creates no attempt and sends no checkout event. Track once at attempt creation if consent allows; refresh, rerenders, and back/forward navigation reuse the active attempt and must not resend. Returning from checkout and explicitly starting again creates a new attempt. Completing an order closes the attempt. Never backfill a pre-consent checkout attempt after acceptance.
 
 **Important:** Avoid firing this repeatedly due to component renders or route refreshes.
 
@@ -482,8 +504,8 @@ Payload:
 - currency,
 - purchased contents.
 
-Options:
-- include a stable `event_id`, for example `order_NM-10482`.
+Required:
+- include a stable `event_id`, for example `order_NM-10482`, derived from the persisted order ID and reused for any delivery attempt for that outcome.
 
 **Reason:** This is the primary e-commerce business outcome and should represent an actual completed order in the demo.
 
@@ -509,8 +531,8 @@ Example:
 }
 ```
 
-Options:
-- include a stable membership `event_id`.
+Required:
+- include a stable membership `event_id`, derived from the persisted enrollment ID and reused for any delivery attempt for that outcome.
 
 **Reason:** The assignment explicitly says Nano Motion is launching a membership/subscription program. Instrumenting this separately shows that the measurement design covers both immediate retail revenue and recurring-revenue strategy.
 
@@ -547,12 +569,14 @@ Each event answers a different question:
 
 ## 11. `event_id` strategy
 
-Generate stable IDs for the two definitive outcomes:
+Generate mandatory stable IDs for the two definitive outcomes:
 
 ```text
 order_created        -> order_<order-id>
 subscription_created -> subscription_<membership-id>
 ```
+
+Stable event IDs support delivery deduplication; they do not stop the application from creating two different orders or enrollments. Guard each submit operation synchronously, disable its button while processing, and reuse the persisted outcome for repeated handling of the same operation. Membership Join must return the existing active demo enrollment rather than create another enrollment. A new independent order may be created only from a new valid checkout attempt.
 
 The browser implementation does not require a server duplicate today, but keeping stable event IDs makes the integration ready for a future Pixel + Conversions API setup.
 
@@ -607,7 +631,10 @@ Display:
 - product/content IDs,
 - amount,
 - currency,
-- event ID when present.
+- event ID when present,
+- local dispatch status: `suppressed` (consent or validation), `queued` (handed to the documented stub while loading), `handed_to_sdk` (SDK loaded), or `failed` (local dispatch or loading failure).
+
+These statuses describe local observations only. `handed_to_sdk` is not an acknowledgment of receipt; script load success is not conversion receipt. If suppressed actions are displayed for demonstration, keep only a bounded in-memory diagnostic log and never use it as a replay queue.
 
 Example:
 
@@ -641,7 +668,7 @@ During implementation, verify events in two ways.
 Enable the Pixel's documented `debug` option during testing and inspect SDK activity.
 
 ### B. Browser network panel
-Use DevTools to verify requests to the OpenAI measurement endpoints.
+Use DevTools to verify requests to the documented OpenAI measurement endpoints and inspect payloads and available responses. Network activity demonstrates browser transport attempts; a successful transport response alone does not establish attribution, reporting inclusion, or optimization eligibility.
 
 Do not rely only on the custom local debug panel.
 
@@ -650,6 +677,19 @@ OpenAI documents an Advertiser API conversion event stream that can show recent 
 
 Reference:
 https://developers.openai.com/ads/api-reference/conversion-setup
+
+---
+
+### Presentation and business-result boundaries
+
+Use this short presentation sequence:
+1. Show consent acceptance, a product view, add-to-cart, checkout, and a simulated order; explain the business question each signal addresses.
+2. Show the local instrumentation log alongside SDK debug output and browser requests; identify each as local intent, SDK activity, or transport evidence.
+3. Refresh confirmation to demonstrate no additional conversion, then show paid demo membership enrollment.
+4. Decline/revoke consent and demonstrate that shopping still works while new measurement submissions stop.
+5. Explain that this demo validates instrumentation and event values. Actual attribution and ROAS require real campaign traffic, conversion reporting, and spend data; optimization impact requires campaign delivery and evaluation. Do not claim these outcomes from simulated purchases or local logs.
+
+For production, assess funnel progression using appropriately scoped sessions/users or checkout attempts rather than dividing raw event counts, since repeated legitimate views and add actions can occur. Explain the membership amount as the initial monthly enrollment value, not lifetime value or evidence of subsequent renewals.
 
 ---
 
@@ -665,7 +705,9 @@ Required examples:
 - order total is correct;
 - `contents[]` contains only documented browser-supported fields;
 - membership uses `plan_enrollment`;
-- stable `event_id` is generated from the order/subscription ID.
+- stable `event_id` is generated from the order/subscription ID;
+- quantity-two unit price, line subtotal, event total, and added-quantity delta agree with the verified schema;
+- fractional, negative, non-finite, or unsafe monetary/quantity inputs are rejected rather than silently emitted; zero is allowed only where the domain and documented schema permit it.
 
 ---
 
@@ -679,7 +721,16 @@ Mock `window.oaiq` and verify:
 - order confirmation refresh does not create a second order event;
 - membership enrollment triggers exactly one `subscription_created`;
 - declining consent prevents measurement calls;
-- accepting consent allows subsequent events.
+- accepting consent allows subsequent events and exactly one applicable current-route view;
+- unknown consent emits no measurement, including during initialization;
+- consent revocation/reset stops new submissions and does not replay earlier actions on reacceptance;
+- delayed script loading uses the official queue only after consent;
+- blocked/failed script loading does not interrupt order or enrollment creation;
+- rapid double-submit creates one persisted order/enrollment and one conversion dispatch;
+- persisted membership confirmation refresh does not resend enrollment;
+- route changes, back/forward, and Strict Mode do not duplicate a visit event;
+- direct checkout with a valid cart creates one attempt, refresh reuses it, and empty checkout emits none;
+- unavailable/corrupt storage produces safe empty states or unknown consent.
 
 ---
 
@@ -718,7 +769,13 @@ Also test:
 - consent decline,
 - consent reset,
 - direct navigation to order confirmation,
-- hard refresh.
+- hard refresh,
+- blocked measurement script and delayed loading,
+- revoke consent while the script is loading,
+- rapid double-click on order and membership submission,
+- membership confirmation refresh and direct navigation,
+- client navigation and back/forward between products,
+- storage unavailable or corrupt.
 
 ---
 
@@ -732,12 +789,15 @@ Checkout should:
 - never collect or store real payment-card data.
 
 On success:
-1. create an order ID;
-2. freeze a snapshot of the cart;
-3. persist the order locally;
-4. fire `order_created` once;
-5. clear the cart;
-6. navigate to confirmation.
+1. acquire a synchronous submission guard for the active checkout attempt and disable repeat submission;
+2. validate a nonempty cart and integer quantities/prices;
+3. create one order ID and freeze the cart snapshot;
+4. persist the order and close the checkout attempt before conversion dispatch; repeated processing must reuse that outcome;
+5. submit `order_created` once with mandatory stable `event_id`, only if consent permits;
+6. clear the cart;
+7. navigate to confirmation even if measurement fails.
+
+If storage cannot persist the outcome, retain it in application memory for the current journey and disclose that confirmation persistence is unavailable. Do not claim reload-safe persistence or recreate a lost outcome on confirmation entry. Measurement errors must never roll back the simulated order.
 
 **Reason:** The assignment needs a conversion event, not a payment integration.
 
@@ -758,10 +818,13 @@ $19/month
 The exact benefits are fictional and should be clearly positioned as demo content.
 
 Enrollment:
-1. user clicks "Join";
-2. create a membership enrollment ID;
-3. fire `subscription_created`;
-4. navigate to confirmation.
+1. user clicks "Join"; acquire a synchronous submission guard and disable repeat submission;
+2. reuse any existing active enrollment, otherwise create one enrollment ID and snapshot the plan;
+3. persist the enrollment before conversion dispatch, with the same storage-failure fallback as orders;
+4. submit `subscription_created` once for a newly created enrollment with mandatory stable `event_id`, only if consent permits;
+5. navigate to confirmation even if measurement fails.
+
+Repeated Join actions and confirmation refresh must display the existing enrollment without creating or sending another subscription event. The $19 amount represents the first monthly enrollment charge in the simulation, not projected lifetime revenue.
 
 Do not build recurring billing.
 
@@ -880,7 +943,14 @@ The implementation is complete when all of the following are true:
 - [ ] Event payloads use only fields supported by the current Pixel documentation.
 - [ ] Purchase refresh does not double-fire.
 - [ ] Subscription confirmation refresh does not double-fire.
-- [ ] Consent can disable measurement.
+- [ ] Consent is disabled while unknown or declined, including during initialization.
+- [ ] Acceptance emits one applicable current-route view without replaying prior actions.
+- [ ] Revocation/reset disables subsequent measurement and prevents historical replay.
+- [ ] Blocked or delayed script loading does not break commerce.
+- [ ] Double-submit cannot create duplicate orders or memberships.
+- [ ] Orders and memberships persist before conversion dispatch and use mandatory stable event IDs.
+- [ ] Route and checkout-attempt boundaries are tested.
+- [ ] Quantity-two payload semantics are verified against current documentation.
 - [ ] Debug mode is available for testing.
 - [ ] Local demo event inspector is clearly labeled as local.
 - [ ] Browser console/network validation is documented.
@@ -903,7 +973,7 @@ The implementation is complete when all of the following are true:
 | Show user journey | Product → cart → checkout → order, plus membership |
 | Demonstrate measurement points | Local event inspector + browser Pixel/network validation |
 | Show scalable integration | Central measurement abstraction and event builders |
-| Address international expansion | Currency-safe schema + consent-aware architecture |
+| Address international expansion | USD-scoped demo, documented currency-unit extension + consent-aware architecture |
 | Address membership strategy | `subscription_created` with `plan_enrollment` |
 | Address attribution | Rely on documented automatic `oppref` handling |
 | Address signal coverage | Product, intent, checkout, order, subscription funnel |
@@ -948,15 +1018,16 @@ Before writing code:
 - membership page
 - simulated enrollment
 
-**Phase 4 — Measurement**
-- Pixel installation
+**Phase 4 — Consent and measurement**
+- consent state, persistence, acceptance, and revocation
+- consent-safe Pixel installation
 - measurement abstraction
 - event builders
 - six events
 - event IDs
 
-**Phase 5 — Consent and debugging**
-- consent banner
+**Phase 5 — Debugging and presentation**
+- presentation sequence and evidence boundaries
 - local event inspector
 - debug configuration
 
