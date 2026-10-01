@@ -1,6 +1,6 @@
 # Nano Motion
 
-A Next.js + TypeScript activewear demo implementing the commerce journey in [the technical design](nano-motion-technical-design.md). Three local illustrated products, a persisted bag, simulated orders and membership, consent controls, and a local instrumentation inspector. No real payments, billing, authentication, backend, or PII collection.
+A Next.js + TypeScript activewear demo with three locally illustrated products, a persisted bag, simulated orders and membership, consent controls, and the OpenAI Measurement Pixel. No real payments, billing, authentication, backend, or personal-information collection.
 
 ## Run locally
 
@@ -12,7 +12,9 @@ cp .env.example .env.local
 npm run dev
 ```
 
-If the environment cannot write its default npm cache, use `npm --cache /tmp/nano-npm-cache ci`.
+On Windows Command Prompt, use `copy .env.example .env.local` instead of `cp`. Leave the terminal running, wait for **Ready**, and open the Local URL shown there with `?measurementDebug=true` appended. Stop the server with Ctrl+C. To pull updates, stop it, run `git pull origin main`, and run `npm run dev` again.
+
+If this cloud environment cannot write its default npm cache, use `npm --cache /tmp/nano-npm-cache ci`.
 
 ```sh
 npm test
@@ -21,44 +23,70 @@ npm run build
 npm run start
 ```
 
-Open the storefront on the development server. Add `?measurementDebug=true` to the initial URL to enable the inspector; it also appears in development. Its visibility persists across client navigation for that document. Consent preferences are always accessible in the footer.
+The event inspector appears in development or when the initial URL includes `?measurementDebug=true`. Its visibility persists across client navigation for that document; include the parameter again when reloading another route. Consent preferences are always accessible in the footer.
 
-## Current integration status
+## OpenAI Pixel integration
 
-**Live OpenAI Pixel dispatch is disabled.** As of 2026-10-01, this workspace's network policy rejects access to `developers.openai.com`, and saving a domain addition through the environment draft tool failed. The official SDK installation snippet, consent API, browser payload schema, and quantity-two item-amount semantics have not been verified. The application deliberately does not load an invented SDK URL or transmit speculative payloads.
+The root layout uses Next.js `beforeInteractive` to install the official command queue and asynchronously load `https://bzrcdn.openai.com/sdk/oaiq.min.js`. It queues `oaiq("consent", false)` **before** the single `init` call. Client hydration restores the accepted/declined preference and applies it through the documented consent command. Consent remains false for unknown or declined preferences.
 
-`NEXT_PUBLIC_OPENAI_PIXEL_ID` is supplied in `.env.example` for the eventual verified adapter. It is public configuration, not a secret. It is not used for live dispatch yet. The six standard names from the design are represented in a **local business-event contract**, not a validated OpenAI wire schema. In particular, local contents use `unitAmount` and enrollment uses `planId`; these are domain fields and are never sent directly to OpenAI.
+`NEXT_PUBLIC_OPENAI_PIXEL_ID` configures the public ID. When unset, it defaults to the assignment's supplied ID, `T8bLgKF4RsYWhHwHnPDJWg`. An explicitly empty value disables SDK installation. Public environment variables are compiled into the frontend; rebuild after changing them. No API key is required for browser measurement.
 
-To complete the integration:
+All six events use documented calls:
 
-1. Make the official documentation accessible, or provide its installation snippet and event schemas. Check measurement-pixel, supported-events, conversions-api, and conversion-tracking.
-2. Add a verified browser adapter in `src/lib/measurement/openaiPixel.ts` that serializes business events into documented SDK calls and places `event_id` exactly where the docs require it. Initialize once with the configured Pixel ID and consent false before any measurement.
-3. Verify line-item `amount` semantics with the two-jacket example in `TESTING.md`. Use only documented browser fields.
-4. Set documented SDK consent before measuring accepted users. Do not queue pre-consent events or replay actions on reacceptance. The current adapter boundary suppresses events while loading to avoid queue replay after revocation; if the SDK supports verified consent-safe queue clearing, implement and test that behavior before changing the policy.
-5. Run mocked SDK integration tests plus console/network validation on the real SDK. Update this status and the inspector notice only after successful verification.
+| Action | Event | Data shape |
+| --- | --- | --- |
+| Important generic route visit | `page_viewed` | `contents` |
+| Product detail visit | `contents_viewed` | `contents` |
+| Successful added quantity | `items_added` | `contents` |
+| New checkout attempt | `checkout_started` | `contents` |
+| Created simulated order | `order_created` | `contents` |
+| New simulated paid membership | `subscription_created` | `plan_enrollment` |
 
-The current inspector labels accepted events `failed` with an explicit documentation blocker. Declined/unknown events are suppressed. Neither local dispatch logs nor HTTP success alone prove OpenAI receipt, attribution, reporting, or optimization results.
+The browser adapter translates domain `planId` to `plan_id`, adds `type` and `content_type`, and passes stable outcome IDs as `{ event_id }` in the **fourth** `measure` argument. Internal `unitAmount` is never serialized. Amounts are USD integer cents; currency is required with an event amount. Purchased quantity is an integer. No `group_id`, `variant_dict`, user-matching fields, or manual attribution identifiers are sent.
 
-## Architecture and behavior
+The SDK handles automatic `oppref` capture, cookies, event timestamps, source origin, and batching. The application does not manufacture ad-click identifiers or claim that demo orders are attributed conversions.
+
+### Consent and loading behavior
+
+The official queue is used for control commands only. Business events are suppressed while the SDK script is loading and never retained for later replay. Once the script is ready and consent is accepted, the current eligible route gets one view; suppressed shopping actions and completed outcomes are not reconstructed. This deliberate coverage tradeoff prevents pending business events from being replayed after consent revocation. Future consent-safe SDK queueing should be evaluated separately.
+
+Revocation/reset calls `oaiq("consent", false)` immediately and stops new measurement. The supplied documentation states that this removes the SDK attribution/browser-reference cookies and blocked events are not replayed. Script-load or SDK-dispatch failures never interrupt commerce. SDK status `ready` means the script loaded; it does not prove per-pixel configuration readiness, event delivery, or processing.
+
+The inspector is labeled **Local instrumentation log**. `handed_to_sdk` describes a local command call, `suppressed` explains consent/loading suppression, and `failed` describes local dispatch/configuration/loading failure. None is an OpenAI receipt acknowledgment. SDK console logging is enabled in development or with the debug query parameter.
+
+### Documentation verification and design differences
+
+Verified against the Measurement Pixel text and Supported Events, Conversion Tracking, Conversions API, Image Tag, Reporting, Troubleshooting, and Conversion Setup copies supplied by the user on 2026-10-01. Multiple Pixel IDs was also supplied; this demo initializes only one pixel.
+
+The design's examples included per-content `amount` and `currency`. Supported Events describes `amount` as an optional item-level monetary value without specifying unit versus extended price. The implementation therefore omits those optional item fields and sends the unambiguous event-level total with product IDs, names, type, and quantities. The two-jacket payload is documented and asserted in `TESTING.md`.
+
+The real SDK CDN and documentation remain blocked by this cloud workspace's network proxy. **The live SDK is wired into the app, but actual OpenAI network delivery has not been validated here.** Browser tests substitute the SDK script at its official CDN URL and assert our real adapter's command sequence and payloads. Complete the real-network checklist in `TESTING.md` from a browser that can reach the OpenAI hosts.
+
+## Architecture
 
 - `src/data/products.ts`: canonical USD catalog, prices in integer cents.
-- `src/lib/cart/store.ts`: client-only hydrated commerce state in one versioned localStorage record. Validate saved data, persist outcomes before conversion dispatch, reuse checkout attempts, and guard repeated submissions with synchronous state updates. Storage failures fall back to memory and show a notice.
-- `src/lib/measurement/eventBuilders.ts`: vendor-independent business events and validated totals. Item-added reports quantity delta; order/checkout reports the full cart snapshot.
-- `src/lib/measurement/openaiPixel.ts`: explicit unknown/accepted/declined consent, route visit boundaries, bounded local diagnostics, and a future adapter boundary. No conversion dispatch on confirmation rendering.
-- `src/components/runtime.tsx`: client hydration and centralized pathname observation, surviving Strict Mode effect replay.
+- `src/lib/cart/store.ts`: hydrated commerce state in one validated, versioned localStorage record. Persist outcomes before conversion dispatch, reuse checkout attempts, and guard repeated submissions with synchronous state updates. Storage failures fall back to memory and show a notice.
+- `src/lib/measurement/eventBuilders.ts`: vendor-independent business events and validated totals. Item-added reports quantity delta; order/checkout reports the full snapshot.
+- `src/lib/measurement/browserPixel.ts`: official SDK bootstrap, documented payload serializer, and browser adapter.
+- `src/lib/measurement/openaiPixel.ts`: consent state, route visit boundaries, SDK status, and bounded local diagnostics. Confirmation rendering never emits conversion events.
+- `src/components/runtime.tsx`: client hydration and centralized route observation. Strict Mode effect replay does not reinitialize the SDK.
 
-An order's cart snapshot is detached from live cart state. Persisting the completed order, closed checkout attempt, and empty cart together reduces inconsistent refresh state. Repeated membership Join reuses the existing saved enrollment. localStorage is demo persistence, not an authoritative transaction store or a cross-tab concurrency guarantee.
+Orders retain detached item snapshots. The completed order, closed attempt, and empty cart persist together. Repeated Join reuses the saved enrollment. localStorage is demo persistence, not an authoritative transaction store or a cross-tab concurrency guarantee.
 
-No script, font, or image requires a third-party CDN for the current storefront. SVG illustrations are local assets. USD only: no tax, shipping charge, or discount; total is the sum of line subtotals. Membership value is the simulated initial $19 month, not lifetime revenue.
+Images and fonts are local/system resources; the Pixel uses the official external CDN. USD only: no tax, shipping charge, or discount. Membership value is the simulated initial $19 month, not lifetime revenue. No PII form fields or manual advanced matching are used. Account-level automatic advanced matching is an SDK feature described in the supplied docs; the demo collects no identity fields for it.
 
 ## Deploy to Vercel
 
-Import this GitHub repository into Vercel, select Next.js, and use the repository root as the project directory. Configure `NEXT_PUBLIC_OPENAI_PIXEL_ID` from `.env.example`. Keep the default install/build settings (`npm ci`, `npm run build`) and deploy after reviewing the live integration status above. Changes to public environment variables require a rebuild.
+Import this GitHub repository, select Next.js, and use the repository root. Configure `NEXT_PUBLIC_OPENAI_PIXEL_ID` from `.env.example`; use the default install/build settings (`npm ci`, `npm run build`). Rebuild when public environment variables change. Verify the real Pixel requests on the resulting HTTPS URL before submission.
 
-The app has passed a production build but **has not been deployed from this task**. Publishing the storefront before adapter completion will provide the demo journey with local instrumentation only. Do not describe that as a complete OpenAI Measurement Pixel deployment.
+The app passes a production build but **has not been publicly deployed from this task**. If adding a CSP, allow the documented SDK/config host `https://bzrcdn.openai.com` and event host `https://bzr.openai.com`; use the application's proper nonce/hash approach for the bootstrap rather than adding `unsafe-inline` just for measurement.
 
-## Production measurement extension
+## Production measurement and reporting
 
-A real order backend would become the confirmed source of purchase/subscription events. Add the Conversions API only with server credentials, consent and attribution handling, documented payload validation, and an idempotent delivery process. Reuse the browser outcome's stable event ID for documented browser/server deduplication. Never expose an API key in browser configuration. The demo does not create attribution identifiers or claim simulated orders are attributed ad conversions.
+A production order backend would provide confirmed purchase/subscription events. Add the Conversions API only with a server-stored key, consent and attribution handling, and idempotent delivery. Reuse the same Pixel ID, event name, and outcome ID (browser `event_id`, server `id`) for deduplication. No API keys belong in browser configuration.
 
-For presentation and reproducible validation, see [TESTING.md](TESTING.md).
+Receiving an event and configuring a campaign conversion goal are separate operations. An account administrator must select the source/event in a conversion event setting and attach it to the appropriate campaign. Recent-event monitoring samples roughly the last 15 minutes and requires an Advertiser API key; it is not historical attributed reporting. The supplied Reporting guide says conversions update through daily processing, so immediate reporting totals should not be used as the SDK integration check.
+
+The supplied Measurement Pixel guide describes Ads Manager's `Conversions` metric as click-through and view-through as separate. The Reporting guide describes the dedicated Insights API `conversions` total as click-through plus view-through under its selected windows. Name the reporting surface, windows, time basis, account timezone, and goal scope when explaining results; do not treat these metrics as interchangeable. ROAS needs real attributed purchase value and spend. None of these account/API operations is implemented in this demo.
+
+For reproducible tests and presentation guidance, see [TESTING.md](TESTING.md) and [the design](nano-motion-technical-design.md).

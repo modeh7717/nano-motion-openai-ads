@@ -1,7 +1,7 @@
 import { products } from "../../data/products";
 import { checkoutStarted, itemAdded, orderCreated, pageViewed, productViewed, subscriptionCreated } from "./eventBuilders";
-import type { BusinessEvent, CartItem, Consent, LogEntry, Membership, Order, PixelAdapter, Product } from "./types";
-export type MeasurementState = { consent: Consent; logs: LogEntry[]; sdk: "unconfigured" | "ready" | "loading" | "failed" };
+import type { BusinessEvent, CartItem, Consent, LogEntry, Membership, Order, PixelAdapter, PixelStatus, Product } from "./types";
+export type MeasurementState = { consent: Consent; logs: LogEntry[]; sdk: PixelStatus };
 const initial: MeasurementState = { consent: "unknown", logs: [], sdk: "unconfigured" };
 export class Measurement {
   private state: MeasurementState = initial;
@@ -23,15 +23,21 @@ export class Measurement {
     try { const saved = storage?.getItem("nano-motion-consent"); if (saved === "accepted" || saved === "declined") consent = saved; } catch { /* Unknown consent is safe. */ }
     this.setConsent(consent);
   }
-  // Only a documentation-verified adapter may be installed. Production has no adapter yet.
   attach(adapter: PixelAdapter) {
+    if (this.adapter) return; // Root runtime effects may replay in React Strict Mode.
     adapter.setConsent(false);
     this.adapter = adapter;
     adapter.setConsent(this.state.consent === "accepted");
-    this.update({ sdk: adapter.ready() ? "ready" : "loading" });
+    adapter.subscribe?.(() => this.adapterStatus());
+    this.adapterStatus();
+  }
+  private adapterStatus() {
+    const sdk = this.adapter?.state?.() ?? (this.adapter?.ready() ? "ready" : "loading");
+    this.update({ sdk });
+    if (sdk === "ready" && this.state.consent === "accepted") this.currentView();
   }
   setConsent(consent: Consent) {
-    try { this.adapter?.setConsent(consent === "accepted"); } catch { this.adapter = undefined; }
+    try { this.adapter?.setConsent(consent === "accepted"); } catch { this.adapter = undefined; this.update({ sdk: "failed" }); }
     try { this.storage?.setItem("nano-motion-consent", consent); } catch { /* Preference remains valid in memory. */ }
     this.update({ consent });
     if (consent === "accepted") this.currentView();
@@ -42,7 +48,7 @@ export class Measurement {
     if (this.state.consent === "accepted") this.currentView();
   }
   private currentView() {
-    if (!this.path || this.viewAttempted) return;
+    if (!this.path || this.viewAttempted || this.state.sdk === "loading") return;
     const product = products.find(p => this.path === `/product/${p.slug}`);
     const generic = ["/", "/shop", "/cart", "/checkout", "/order-confirmation", "/membership", "/membership-confirmation"];
     if (!product && !generic.includes(this.path)) return;
@@ -53,9 +59,12 @@ export class Measurement {
     let status: LogEntry["status"] = "suppressed";
     let reason = "Measurement consent is not accepted";
     if (this.state.consent === "accepted") {
-      status = "failed"; reason = "Live Pixel disabled: official SDK documentation has not been verified";
+      status = "failed"; reason = "Pixel is not configured; check NEXT_PUBLIC_OPENAI_PIXEL_ID";
       if (this.adapter) {
-        if (!this.adapter.ready()) { status = "suppressed"; reason = "SDK loading; event not retained or replayed"; }
+        if (!this.adapter.ready()) {
+          if (this.state.sdk === "loading") { status = "suppressed"; reason = "SDK loading; event not retained or replayed"; }
+          else { reason = this.state.sdk === "failed" ? "Pixel script failed to load; commerce continues" : "Pixel is not configured; check NEXT_PUBLIC_OPENAI_PIXEL_ID"; }
+        }
         else try { status = this.adapter.dispatch(event); reason = "Local dispatch only; OpenAI receipt is unconfirmed"; }
         catch { reason = "SDK dispatch failed; commerce continues"; this.update({ sdk: "failed" }); }
       }

@@ -6,6 +6,8 @@
 **Pixel ID:** `T8bLgKF4RsYWhHwHnPDJWg`  
 **Last updated:** 2026-10-01
 
+**Implementation note (2026-10-01):** The SDK installation, consent commands, all six event names/shapes, and fourth-argument `event_id` placement were checked against official documentation supplied by the user. The browser integration is implemented. Optional per-item monetary fields are omitted because the docs do not specify unit versus line-total semantics; event-level totals and item quantities are sent. Actions during script loading are suppressed without replay, and the current eligible view is measured once after readiness and acceptance. Actual SDK/network receipt and public deployment remain to be validated; see `README.md` and `TESTING.md`.
+
 ---
 
 ## 1. Assignment context
@@ -272,7 +274,7 @@ Each product should have:
 
 **Demo currency scope:** USD only. Store positive safe-integer prices in cents and positive integer cart quantities. The demo has no shipping charges, taxes, or discounts, so order value is the sum of item subtotals. Future international support must use each supported currency's minor-unit exponent; do not multiply every currency by 100.
 
-**Quantity-two contract:** Two Aero Run Jackets have a unit price of `14800`, quantity `2`, line subtotal `29600`, and cart/order total `29600` USD. Confirm whether the documented per-content `amount` represents unit price or line subtotal before constructing the SDK payload, and include that verified example in the tests. `items_added` reports only the quantity added by that action: adding one jacket to a cart that already contains one reports a delta of one and an event value of `14800`, not the resulting cart total. Checkout and order payloads report the complete snapshot and its total.
+**Quantity-two contract:** Two Aero Run Jackets have a unit price of `14800`, quantity `2`, line subtotal `29600`, and cart/order total `29600` USD. Send the event-level total and quantity in the SDK payload. Omit optional per-content monetary fields while unit-versus-line-total semantics remain unspecified in the documentation; include the documented quantity-two example in the tests. `items_added` reports only the quantity added by that action: adding one jacket to a cart that already contains one reports a delta of one and an event value of `14800`, not the resulting cart total. Checkout and order payloads report the complete snapshot and its total.
 
 ---
 
@@ -322,7 +324,7 @@ Include TypeScript definitions for:
 
 Do not invent undocumented OpenAI payload fields.
 
-Keep domain unit price, quantity, line subtotal, and order total distinct. Before implementation, verify the official meanings of top-level `amount` and per-content `amount`; record the checked documentation date and final quantity-two payload in `TESTING.md`. The examples below are conceptual until this verification is complete.
+Keep domain unit price, quantity, line subtotal, and order total distinct. The supplied Supported Events documentation defines top-level `amount` as event-level monetary value. It calls per-content `amount` item-level value without specifying unit versus line total, so the implementation omits that optional field. Record the checked documentation date and final quantity-two payload in `TESTING.md`.
 
 ---
 
@@ -435,9 +437,7 @@ Example:
       id: "NM-RUN-001",
       name: "Aero Run Jacket",
       content_type: "product",
-      quantity: 1,
-      amount: 14800,
-      currency: "USD"
+      quantity: 1
     }
   ]
 }
@@ -464,9 +464,7 @@ Example:
       id: "NM-RUN-001",
       name: "Aero Run Jacket",
       content_type: "product",
-      quantity: 1,
-      amount: 14800,
-      currency: "USD"
+      quantity: 1
     }
   ]
 }
