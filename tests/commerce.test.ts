@@ -4,30 +4,49 @@ import { Measurement } from "../src/lib/measurement/openaiPixel";
 import { cartTotal, itemAdded, orderCreated, productViewed, subscriptionCreated } from "../src/lib/measurement/eventBuilders";
 import type { BusinessEvent } from "../src/lib/measurement/types";
 import { products } from "../src/data/products";
+// Use a simple in-memory substitute for browser storage so each test starts with clean data.
 function memory() { const data = new Map<string, string>(); return { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => { data.set(key, value); } }; }
+// Create a shopping store with measurement recorders instead of real SDK calls.
 function fixture() { const storage = memory(); const tracker = { trackItemAdded: vi.fn(), trackCheckoutStarted: vi.fn(), trackOrderCreated: vi.fn(), trackSubscriptionCreated: vi.fn() }; const store = new CommerceStore(tracker); store.boot(storage); return { storage, tracker, store }; }
+// Check product quantities and money before those values become documented Pixel payloads.
 describe("business event builders", () => {
+  // Report the added units and their subtotal, keeping the unit price separate internally.
   it("distinguishes quantity-two subtotal from unit price and only reports added delta", () => { const event = itemAdded(products[0], 2); expect(event.data.amount).toBe(29600); expect(event.data.contents?.[0]).toEqual({ id: "NM-RUN-001", name: "Aero Run Jacket", quantity: 2, unitAmount: 14800 }); expect(itemAdded(products[0], 1).data.amount).toBe(14800); expect(productViewed(products[0]).name).toBe("contents_viewed"); });
+  // Check combined totals and reject values that cannot represent valid cart items.
   it("totals multiple products and rejects invalid quantities, unknown products, and unsafe totals", () => { expect(cartTotal([{ productId: products[0].id, quantity: 2 }, { productId: products[1].id, quantity: 1 }])).toBe(41400); for (const quantity of [0, -1, .5, Infinity, NaN, Number.MAX_SAFE_INTEGER]) expect(() => cartTotal([{ productId: products[0].id, quantity }])).toThrow(); expect(() => cartTotal([{ productId: "unknown", quantity: 1 }])).toThrow(); });
 });
+// Check when shopping events are reported and how saved outcomes prevent repeat conversions.
 describe("commerce lifecycle", () => {
+  // Save a purchase before reporting it, then reuse it on repeated submits and restoration.
   it("persists before conversion, handles repeat submission, and restores without emitting", () => {
     const { store, tracker, storage } = fixture(); store.add(products[0].id, 2); store.beginCheckout(); store.beginCheckout(); expect(tracker.trackCheckoutStarted).toHaveBeenCalledTimes(1);
     tracker.trackOrderCreated.mockImplementation(() => { expect(JSON.parse(storage.getItem("nano-motion-commerce-v1")!).order.amount).toBe(29600); });
     const order = store.completeOrder()!; expect(store.completeOrder()?.id).toBe(order.id); expect(tracker.trackOrderCreated).toHaveBeenCalledTimes(1); expect(orderCreated(order).eventId).toBe(`order_${order.id}`); expect(store.getSnapshot().cart).toEqual([]);
     const restored = new CommerceStore(tracker); restored.boot(storage); expect(restored.getSnapshot().order).toEqual(order); expect(tracker.trackOrderCreated).toHaveBeenCalledTimes(1);
   });
+  // Resume saved checkout without another event unless a new attempt is explicitly requested.
   it("reuses a persisted checkout attempt and permits an explicit new attempt", () => { const { store, tracker, storage } = fixture(); store.add(products[0].id); const attempt = store.beginCheckout()!; const restored = new CommerceStore(tracker); restored.boot(storage); expect(restored.beginCheckout()?.id).toBe(attempt.id); expect(tracker.trackCheckoutStarted).toHaveBeenCalledTimes(1); expect(restored.beginCheckout(true)?.id).not.toBe(attempt.id); expect(tracker.trackCheckoutStarted).toHaveBeenCalledTimes(2); });
+  // Reuse a membership ID so repeated joins and reloads do not create another conversion.
   it("membership double-submit and refresh reuse one enrollment", () => { const { store, tracker, storage } = fixture(); const member = store.enroll()!; expect(store.enroll()).toBe(member); expect(tracker.trackSubscriptionCreated).toHaveBeenCalledTimes(1); expect(subscriptionCreated(member)).toMatchObject({ eventId: `subscription_${member.id}`, data: { amount: 1900, planId: "nano-motion-plus-monthly", currency: "USD" } }); const restored = new CommerceStore(tracker); restored.boot(storage); expect(restored.enroll()?.id).toBe(member.id); expect(tracker.trackSubscriptionCreated).toHaveBeenCalledTimes(1); });
+  // Measure only newly added units; decreases and removals should not report items_added.
   it("emits quantity increases as delta, not resulting cart contents", () => { const { store, tracker } = fixture(); store.add(products[0].id); store.setQuantity(products[0].id, 3); expect(tracker.trackItemAdded.mock.calls[1][1]).toBe(2); store.setQuantity(products[0].id, 1); expect(tracker.trackItemAdded).toHaveBeenCalledTimes(2); store.setQuantity(products[0].id, 0); expect(store.beginCheckout()).toBeNull(); });
+  // Complete the demo order even when storage and measurement both fail.
   it("commerce succeeds despite broken storage and throwing measurement", () => { const { tracker } = fixture(); tracker.trackOrderCreated.mockImplementation(() => { throw new Error("blocked"); }); const store = new CommerceStore(tracker); store.boot({ getItem: () => { throw new Error("denied"); }, setItem: () => { throw new Error("denied"); } }); store.add(products[0].id); store.beginCheckout(); expect(store.completeOrder()?.amount).toBe(14800); expect(store.getSnapshot().storageAvailable).toBe(false); });
+  // Ignore invalid saved data rather than turning it into a purchase or measurement event.
   it("rejects corrupt snapshots without creating an outcome", () => { const { tracker } = fixture(); const store = new CommerceStore(tracker); store.boot({ getItem: () => '{"cart":[{"productId":"unknown","quantity":1}]}', setItem: () => {} }); expect(store.getSnapshot().cart).toEqual([]); expect(store.getSnapshot().order).toBeNull(); expect(store.completeOrder()).toBeNull(); expect(tracker.trackOrderCreated).not.toHaveBeenCalled(); });
 });
+// Check the app's consent rules and local logging without loading the official SDK.
 describe("consent and local dispatch", () => {
+  // Supply a controllable fake adapter to observe consent changes and event dispatches.
   function fixture(ready = true) { const tracker = new Measurement(); const adapter = { setConsent: vi.fn(), dispatch: vi.fn((_event: BusinessEvent) => "handed_to_sdk" as const), ready: vi.fn(() => ready) }; tracker.boot(memory()); tracker.attach(adapter); return { tracker, adapter }; }
+  // Hold all measurement until acceptance, then report the current page once.
   it("unknown and declined consent never dispatch, acceptance sends current view once", () => { const { tracker, adapter } = fixture(); tracker.visit("/"); tracker.dispatch(itemAdded(products[0], 1)); tracker.setConsent("declined"); expect(adapter.dispatch).not.toHaveBeenCalled(); tracker.setConsent("accepted"); tracker.visit("/"); expect(adapter.dispatch).toHaveBeenCalledTimes(1); expect(adapter.dispatch.mock.calls[0][0]).toMatchObject({ name: "page_viewed" }); });
+  // Accepting again must not replay actions performed while measurement was disabled.
   it("revocation and reacceptance never backfill actions", () => { const { tracker, adapter } = fixture(); tracker.visit("/shop"); tracker.setConsent("accepted"); tracker.setConsent("unknown"); tracker.dispatch(itemAdded(products[0], 2)); tracker.setConsent("accepted"); expect(adapter.dispatch).toHaveBeenCalledTimes(1); tracker.dispatch(itemAdded(products[0], 1)); expect(adapter.dispatch).toHaveBeenCalledTimes(2); expect(adapter.setConsent).toHaveBeenCalledWith(false); });
+  // Repeated reports of one path are ignored, but leaving and returning creates a new view.
   it("rerenders do not duplicate views, returning to a product creates a new view", () => { const { tracker, adapter } = fixture(); tracker.setConsent("accepted"); tracker.visit("/product/aero-run-jacket"); tracker.visit("/product/aero-run-jacket"); tracker.visit("/shop"); tracker.visit("/product/aero-run-jacket"); expect(adapter.dispatch.mock.calls.map(call => call[0].name)).toEqual(["contents_viewed", "page_viewed", "contents_viewed"]); });
+  // Drop attempts before readiness and record SDK errors instead of throwing into shopping.
   it("drops loading events and never replays them, SDK errors are caught", () => { const { tracker, adapter } = fixture(false); tracker.setConsent("accepted"); tracker.dispatch(itemAdded(products[0], 1)); expect(adapter.dispatch).not.toHaveBeenCalled(); adapter.ready.mockReturnValue(true); expect(adapter.dispatch).not.toHaveBeenCalled(); adapter.dispatch.mockImplementation(() => { throw new Error("network failure"); }); expect(() => tracker.dispatch(itemAdded(products[0], 1))).not.toThrow(); expect(tracker.getSnapshot().logs.at(-1)?.status).toBe("failed"); });
+  // Keep only the newest 50 diagnostic entries when no SDK adapter is configured.
   it("unconfigured SDK fails safely and log is bounded", () => { const tracker = new Measurement(); tracker.boot(memory()); tracker.setConsent("accepted"); for (let i = 0; i < 60; i++) tracker.dispatch(itemAdded(products[0], 1)); expect(tracker.getSnapshot().logs).toHaveLength(50); expect(tracker.getSnapshot().logs[0].reason).toContain("not configured"); });
 });
